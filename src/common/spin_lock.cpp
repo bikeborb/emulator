@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+
 #include "common/spin_lock.h"
 
 #if _MSC_VER
@@ -48,6 +50,26 @@ bool SpinLock::try_lock() {
         return false;
     }
     return true;
+}
+
+void SpinningRecursiveMutex::lock() {
+    // Shorter than a sleep and wake on a phone (about 140 microseconds measured above), longer
+    // than the holds it is meant for. A lock still held after it is waited for the usual way.
+    static constexpr auto spin_time = std::chrono::microseconds{100};
+    static constexpr int pauses_per_try = 32;
+    if (mutex.try_lock()) {
+        return;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + spin_time;
+    do {
+        for (int i = 0; i < pauses_per_try; ++i) {
+            ThreadPause();
+        }
+        if (mutex.try_lock()) {
+            return;
+        }
+    } while (std::chrono::steady_clock::now() < deadline);
+    mutex.lock();
 }
 
 } // namespace Common

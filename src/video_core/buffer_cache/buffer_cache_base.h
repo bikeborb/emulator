@@ -24,6 +24,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "common/spin_lock.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/uma.h"
 #include "video_core/cache_memory_pressure.h"
@@ -319,7 +320,7 @@ public:
         } while (channel_state->has_deleted_buffers);
     }
 
-    mutable std::recursive_mutex mutex;
+    mutable Common::SpinningRecursiveMutex mutex;
     Runtime& runtime;
 
 private:
