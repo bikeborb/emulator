@@ -451,7 +451,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
     }
 
     // The caller hands this range to GPU work (queries, indirect dispatch, DMA image copies).
-    Uma::StampPages(buffer.page_gpu_tick, buffer.Offset(device_addr), size, runtime.CurrentTick());
+    buffer.page_gpu_tick.Stamp(buffer.Offset(device_addr), size, runtime.CurrentTick());
     return {&buffer, buffer.Offset(device_addr)};
 }
 
@@ -871,7 +871,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
             std::memcpy(upload_staging.mapped_span.data(),
                         draw_state.inline_index_draw_indexes.data(), size);
             runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true);
-            Uma::StampPages(buffer.page_gpu_tick, 0, size, runtime.CurrentTick());
+            buffer.page_gpu_tick.Stamp(0, size, runtime.CurrentTick());
         } else {
             buffer.ImmediateUpload(0, draw_state.inline_index_draw_indexes);
         }
@@ -1754,7 +1754,7 @@ template <class P>
 void BufferCache<P>::MarkGpuUse(Buffer& buffer, u64 offset, u64 size) {
     const u64 tick = runtime.CurrentTick();
     buffer.MarkUsage(offset, size, tick);
-    Uma::StampPages(buffer.page_gpu_tick, offset, size, tick);
+    buffer.page_gpu_tick.Stamp(offset, size, tick);
 }
 
 template <class P>
@@ -1796,8 +1796,8 @@ bool BufferCache<P>::UploadNeedsOrderedCopy([[maybe_unused]] Buffer& buffer,
         const u64 offset = buffer.Offset(device_addr);
         const std::span<u8> mapped = buffer.Mapped();
         if (offset <= mapped.size() && size <= mapped.size() - offset &&
-            Uma::CanWriteDirectly(!mapped.empty(), buffer.page_gpu_tick, offset, size,
-                                  runtime.KnownGpuTick())) {
+            buffer.page_gpu_tick.CanWriteDirectly(!mapped.empty(), offset, size,
+                                                  runtime.KnownGpuTick())) {
             return false;
         }
         const std::array copies{BufferCopy{.src_offset = 0, .dst_offset = offset, .size = size}};
@@ -1857,8 +1857,8 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         const bool direct = std::ranges::all_of(copies, [&](const BufferCopy& copy) {
             return copy.dst_offset <= mapped.size() &&
                    copy.size <= mapped.size() - copy.dst_offset &&
-                   Uma::CanWriteDirectly(!mapped.empty(), buffer.page_gpu_tick, copy.dst_offset,
-                                         copy.size, known_gpu_tick);
+                   buffer.page_gpu_tick.CanWriteDirectly(!mapped.empty(), copy.dst_offset,
+                                                         copy.size, known_gpu_tick);
         });
         Async_Buffer upload_staging{};
         std::span<u8> destination = mapped;
@@ -1938,7 +1938,7 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
         // The GPU copy writes these ranges: a later direct write must wait for it.
         const u64 tick = runtime.CurrentTick();
         for (const BufferCopy& copy : copies) {
-            Uma::StampPages(buffer.page_gpu_tick, copy.dst_offset, copy.size, tick);
+            buffer.page_gpu_tick.Stamp(copy.dst_offset, copy.size, tick);
         }
     }
 }
@@ -1982,8 +1982,7 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
-        Uma::StampPages(buffer.page_gpu_tick, buffer.Offset(dest_address), copy_size,
-                        runtime.CurrentTick());
+        buffer.page_gpu_tick.Stamp(buffer.Offset(dest_address), copy_size, runtime.CurrentTick());
     } else {
         buffer.ImmediateUpload(buffer.Offset(dest_address), inlined_buffer.first(copy_size));
     }
@@ -2238,8 +2237,8 @@ template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectCount() {
     const Binding& binding = channel_state->count_buffer_binding;
     auto& buffer = slot_buffers[binding.buffer_id];
-    Uma::StampPages(buffer.page_gpu_tick, buffer.Offset(binding.device_addr), binding.size,
-                    runtime.CurrentTick());
+    buffer.page_gpu_tick.Stamp(buffer.Offset(binding.device_addr), binding.size,
+                               runtime.CurrentTick());
     return std::make_pair(&buffer, buffer.Offset(binding.device_addr));
 }
 
@@ -2247,8 +2246,8 @@ template <class P>
 std::pair<typename BufferCache<P>::Buffer*, u32> BufferCache<P>::GetDrawIndirectBuffer() {
     const Binding& binding = channel_state->indirect_buffer_binding;
     auto& buffer = slot_buffers[binding.buffer_id];
-    Uma::StampPages(buffer.page_gpu_tick, buffer.Offset(binding.device_addr), binding.size,
-                    runtime.CurrentTick());
+    buffer.page_gpu_tick.Stamp(buffer.Offset(binding.device_addr), binding.size,
+                               runtime.CurrentTick());
     return std::make_pair(&buffer, buffer.Offset(binding.device_addr));
 }
 

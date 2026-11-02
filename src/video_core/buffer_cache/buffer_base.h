@@ -41,8 +41,7 @@ public:
     static constexpr u64 BASE_PAGE_SIZE = 1ULL << BASE_PAGE_BITS;
 
     explicit BufferBase(VAddr cpu_addr_, u64 size_bytes_)
-        : page_gpu_tick(Uma::PageCount(size_bytes_), 0), cpu_addr{cpu_addr_},
-          size_bytes{size_bytes_} {}
+        : page_gpu_tick(size_bytes_), cpu_addr{cpu_addr_}, size_bytes{size_bytes_} {}
 
     explicit BufferBase(NullBufferParams) {}
 
@@ -121,7 +120,7 @@ public:
     /// Per page (Uma::PAGE_BITS): the scheduler tick current when GPU work was last handed that
     /// page. Read by the unified memory upload rule (uma.h); written by BufferCache at every
     /// such hand-off.
-    std::vector<u64> page_gpu_tick;
+    Uma::PageTicks page_gpu_tick;
 
 private:
     VAddr cpu_addr = 0;

@@ -68,3 +68,62 @@ TEST_CASE("Uma: a fresh buffer can be written once the first tick is done", "[vi
     REQUIRE_FALSE(CanWriteDirectly(true, ticks, 0, 16, 0));
     REQUIRE(CanWriteDirectly(true, ticks, 0, 16, 1));
 }
+
+using VideoCommon::Uma::PageTicks;
+
+TEST_CASE("Uma: PageTicks answers like StampPages while stamps of a tick are pending",
+          "[video_core][uma]") {
+    PageTicks ticks(4 * 4096);
+    ticks.Stamp(0, 4096, 7);    // page 0
+    ticks.Stamp(4096, 4096, 7); // page 1: touches page 0, merged, nothing written yet
+    REQUIRE_FALSE(ticks.CanWriteDirectly(true, 4100, 16, 7));
+    REQUIRE(ticks.CanWriteDirectly(true, 4100, 16, 8));
+    REQUIRE(ticks.CanWriteDirectly(true, 8192, 16, 1)); // page 2 was never stamped
+    REQUIRE_FALSE(ticks.CanWriteDirectly(false, 8192, 16, 100));
+}
+
+TEST_CASE("Uma: PageTicks keeps a pending range after a later tick or a range apart",
+          "[video_core][uma]") {
+    PageTicks ticks(4 * 4096);
+    ticks.Stamp(0, 100, 5);         // page 0 at tick 5
+    ticks.Stamp(12288, 100, 5);     // page 3, apart: page 0 is written, page 3 pending
+    ticks.Stamp(4096, 4096 * 2, 9); // pages 1 and 2 at tick 9: page 3 is written at tick 5
+    REQUIRE_FALSE(ticks.CanWriteDirectly(true, 0, 16, 5));
+    REQUIRE(ticks.CanWriteDirectly(true, 0, 16, 6));
+    REQUIRE(ticks.CanWriteDirectly(true, 12288, 16, 6));
+    REQUIRE_FALSE(ticks.CanWriteDirectly(true, 8000, 300, 6)); // reaches pages 1 and 2
+    REQUIRE(ticks.CanWriteDirectly(true, 8000, 300, 10));
+    REQUIRE_FALSE(ticks.CanWriteDirectly(true, 16380, 16, 100)); // past the last page
+}
+
+TEST_CASE("Uma: PageTicks matches StampPages on a sequence of stamps", "[video_core][uma]") {
+    // The same stamps through PageTicks and through StampPages on a plain array must give the
+    // same answer for every page and every known GPU tick.
+    struct StampCall {
+        u64 offset;
+        u64 size;
+        u64 tick;
+    };
+    const std::array<StampCall, 9> calls{{{0, 1u << 20, 1},
+                                          {4096, 100, 1},
+                                          {65536, 8192, 2},
+                                          {61440, 8192, 2},
+                                          {200000, 50, 2},
+                                          {0, 4096, 3},
+                                          {1u << 19, 1u << 19, 3},
+                                          {300000, 1, 4},
+                                          {300000, 1, 4}}};
+    constexpr u64 size = 1u << 20;
+    PageTicks merged(size);
+    std::array<u64, size / 4096> plain{};
+    for (const StampCall& call : calls) {
+        merged.Stamp(call.offset, call.size, call.tick);
+        StampPages(plain, call.offset, call.size, call.tick);
+        for (u64 page = 0; page < plain.size(); ++page) {
+            for (u64 known = 0; known <= 5; ++known) {
+                REQUIRE(merged.CanWriteDirectly(true, page * 4096, 4096, known) ==
+                        CanWriteDirectly(true, plain, page * 4096, 4096, known));
+            }
+        }
+    }
+}

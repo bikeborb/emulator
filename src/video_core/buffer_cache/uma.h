@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -66,5 +67,68 @@ constexpr void StampPages(std::span<u64> page_ticks, u64 offset, u64 size, u64 t
     }
     return true;
 }
+
+/// The page stamps of one buffer, with the stamps of the current tick merged before they are
+/// written. A vertex stream is handed to GPU work with its whole range, often megabytes, on
+/// every draw that rebinds it; stamping that range each time was about 80 million page stamps a
+/// second in the opening of Red Dead Redemption (desktop build), nearly all of them the same
+/// pages with the same tick. Stamps of one tick that overlap or touch are kept as one pending
+/// range, written once when a stamp of another tick or a range apart from it comes in.
+/// CanWriteDirectly reads the pending range as well, so nothing is lost by waiting.
+class PageTicks {
+public:
+    PageTicks() = default;
+    explicit PageTicks(u64 size_bytes) : ticks(PageCount(size_bytes), 0) {}
+
+    /// StampPages for this buffer.
+    void Stamp(u64 offset, u64 size, u64 tick) noexcept {
+        if (size == 0) {
+            return;
+        }
+        const u64 first = offset >> PAGE_BITS;
+        if (first >= ticks.size()) {
+            return;
+        }
+        const u64 end = std::min<u64>(ticks.size(), ((offset + size - 1) >> PAGE_BITS) + 1);
+        if (tick == pending_tick && pending_first != pending_end && first <= pending_end &&
+            end >= pending_first) {
+            pending_first = std::min(pending_first, first);
+            pending_end = std::max(pending_end, end);
+            return;
+        }
+        Flush();
+        pending_tick = tick;
+        pending_first = first;
+        pending_end = end;
+    }
+
+    /// Uma::CanWriteDirectly for this buffer.
+    [[nodiscard]] bool CanWriteDirectly(bool is_mapped, u64 offset, u64 size,
+                                        u64 known_gpu_tick) const noexcept {
+        if (is_mapped && size != 0 && pending_first != pending_end &&
+            known_gpu_tick <= pending_tick) {
+            const u64 first = offset >> PAGE_BITS;
+            const u64 last = (offset + size - 1) >> PAGE_BITS;
+            if (first < pending_end && last >= pending_first) {
+                return false;
+            }
+        }
+        return Uma::CanWriteDirectly(is_mapped, ticks, offset, size, known_gpu_tick);
+    }
+
+private:
+    void Flush() noexcept {
+        if (pending_first != pending_end) {
+            std::fill(ticks.begin() + pending_first, ticks.begin() + pending_end, pending_tick);
+        }
+        pending_first = 0;
+        pending_end = 0;
+    }
+
+    std::vector<u64> ticks;
+    u64 pending_tick = 0;
+    u64 pending_first = 0; ///< First page of the pending range
+    u64 pending_end = 0;   ///< One past its last page; equal to pending_first when empty
+};
 
 } // namespace VideoCommon::Uma
