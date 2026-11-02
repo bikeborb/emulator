@@ -17,6 +17,23 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 
+// DIAG (not for commit): the guest-write / GPU-upload loop of the buffer cache.
+#include <chrono>
+#include <unordered_map>
+#include "common/logging.h"
+inline thread_local int g_diag_sync_site = 0; // 1 vertex, 2 index, 3 uniform, 4 storage, 0 other
+struct DiagUploadLoop {
+    struct PerBuffer {
+        u64 size = 0, upload_bytes = 0, uploads = 0, fault_bytes = 0, faults = 0, max_bound = 0;
+        int site = 0;
+    };
+    u64 calls[5]{}, upload_calls[5]{}, upload_bytes[5]{}, upload_ranges[5]{}, bound_bytes[5]{};
+    u64 fault_calls = 0, fault_bytes = 0, fault_bytes_in_buffers = 0;
+    std::unordered_map<const void*, PerBuffer> buffers;
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+inline DiagUploadLoop g_diag_loop;
+
 namespace VideoCommon {
 
 using Core::DEVICE_PAGESIZE;
@@ -194,6 +211,20 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
     if (size <= DEVICE_PAGESIZE) {
         size = WidenHotWrite(device_addr, size);
     }
+    ++g_diag_loop.fault_calls;
+    g_diag_loop.fault_bytes += size;
+    ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+        const DAddr lo = std::max<DAddr>(device_addr, buffer.CpuAddr());
+        const DAddr hi = std::min<DAddr>(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
+        if (hi <= lo) {
+            return;
+        }
+        auto& b = g_diag_loop.buffers[&buffer];
+        b.size = buffer.SizeBytes();
+        b.fault_bytes += hi - lo;
+        ++b.faults;
+        g_diag_loop.fault_bytes_in_buffers += hi - lo;
+    });
     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -876,7 +907,9 @@ void BufferCache<P>::BindHostIndexBuffer() {
             buffer.ImmediateUpload(0, draw_state.inline_index_draw_indexes);
         }
     } else {
+        g_diag_sync_site = 2;
         SynchronizeBuffer(buffer, channel_state->index_buffer.device_addr, size);
+        g_diag_sync_site = 0;
     }
     if constexpr (HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
         const u32 new_offset =
@@ -900,7 +933,9 @@ void BufferCache<P>::BindHostVertexBuffers() {
         const Binding& binding = channel_state->vertex_buffers[index];
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
+        g_diag_sync_site = 1;
         SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+        g_diag_sync_site = 0;
     });
     for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
         if (!flags[Dirty::VertexBuffer0 + index]) {
@@ -1069,7 +1104,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                                       "BufferCache.BindMappedUniformBuffer", false);
         return;
     }
+    g_diag_sync_site = 3;
     const bool sync_cached = SynchronizeBuffer(buffer, device_addr, size);
+    g_diag_sync_site = 0;
     if (sync_cached) {
         ++channel_state->uniform_cache_hits[0];
     }
@@ -1112,7 +1149,9 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
+        g_diag_sync_site = 4;
         SynchronizeBuffer(buffer, binding.device_addr, size);
+        g_diag_sync_site = 0;
 
         const u32 offset = buffer.Offset(binding.device_addr);
         MarkGpuUse(buffer, offset, size);
@@ -1772,6 +1811,59 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
         total_size_bytes += range_size;
         largest_copy = std::max(largest_copy, range_size);
     });
+    {
+        const int site = g_diag_sync_site;
+        auto& L = g_diag_loop;
+        ++L.calls[site];
+        L.bound_bytes[site] += size;
+        auto& b = L.buffers[&buffer];
+        b.size = buffer.SizeBytes();
+        b.max_bound = std::max<u64>(b.max_bound, size);
+        if (total_size_bytes != 0) {
+            ++L.upload_calls[site];
+            L.upload_bytes[site] += total_size_bytes;
+            L.upload_ranges[site] += copies.size();
+            b.upload_bytes += total_size_bytes;
+            ++b.uploads;
+            b.site = site;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - L.window >= std::chrono::seconds(2)) {
+            const double s = std::chrono::duration<double>(now - L.window).count();
+            const auto ps = [s](u64 v) { return static_cast<double>(v) / s; };
+            const auto kps = [s](u64 v) { return static_cast<double>(v) / 1024.0 / s; };
+            static const char* names[5] = {"other", "vertex", "index", "uniform", "storage"};
+            for (int i = 0; i < 5; ++i) {
+                LOG_WARNING(HW_GPU,
+                            "DIAG loop/s {}: sync {:.0f} bound {:.0f} KiB | uploads {:.0f} "
+                            "ranges {:.0f} {:.0f} KiB",
+                            names[i], ps(L.calls[i]), kps(L.bound_bytes[i]),
+                            ps(L.upload_calls[i]), ps(L.upload_ranges[i]),
+                            kps(L.upload_bytes[i]));
+            }
+            LOG_WARNING(HW_GPU,
+                        "DIAG loop/s faults {:.0f} {:.0f} KiB ({:.0f} KiB in buffers) | protect "
+                        "{:.0f} unprotect {:.0f} pages",
+                        ps(L.fault_calls), kps(L.fault_bytes), kps(L.fault_bytes_in_buffers),
+                        ps(VideoCommon::g_diag_protect_pages.exchange(0)),
+                        ps(VideoCommon::g_diag_unprotect_pages.exchange(0)));
+            std::vector<std::pair<const void*, DiagUploadLoop::PerBuffer>> top(L.buffers.begin(),
+                                                                                L.buffers.end());
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& c) {
+                return a.second.upload_bytes + a.second.fault_bytes >
+                       c.second.upload_bytes + c.second.fault_bytes;
+            });
+            for (size_t i = 0; i < std::min<size_t>(8, top.size()); ++i) {
+                const auto& p = top[i].second;
+                LOG_WARNING(HW_GPU,
+                            "DIAG loop buffer {} {}: size {} KiB, max bound {} KiB | uploads "
+                            "{:.0f}/s {:.0f} KiB/s | faults {:.0f}/s {:.0f} KiB/s",
+                            i, names[p.site], p.size / 1024, p.max_bound / 1024, ps(p.uploads),
+                            kps(p.upload_bytes), ps(p.faults), kps(p.fault_bytes));
+            }
+            L = DiagUploadLoop{};
+        }
+    }
     if (total_size_bytes == 0) {
         return true;
     }

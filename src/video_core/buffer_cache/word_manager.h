@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -14,6 +16,12 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+
+namespace VideoCommon {
+// DIAG (not for commit): pages the buffer cache starts and stops watching.
+inline std::atomic<u64> g_diag_protect_pages{0};
+inline std::atomic<u64> g_diag_unprotect_pages{0};
+}
 
 namespace VideoCommon {
 
@@ -472,6 +480,8 @@ private:
         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
         IteratePages(changed_bits, [&](size_t offset, size_t size) {
+            (add_to_tracker ? g_diag_protect_pages : g_diag_unprotect_pages)
+                .fetch_add(size, std::memory_order_relaxed);
             tracker->UpdatePagesCachedCount(addr + offset * BYTES_PER_PAGE, size * BYTES_PER_PAGE,
                                             add_to_tracker ? 1 : -1);
         });
